@@ -6,108 +6,126 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 )
 
-// PendingHosts stores IP -> Hostname mapping temporarily until 'accept' is called
+// PendingHosts stores IP -> Hostname mapping
 var (
 	PendingHosts = make(map[string]string)
 	mutex        = &sync.Mutex{}
 )
 
-// StartRegistrationServer runs on the Jumpbox to listen for "Hello" from children
+// StartRegistrationServer runs on the Jumpbox
 func StartRegistrationServer(port string) {
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		hostname := r.URL.Query().Get("host")
-		ip := r.RemoteAddr // Format usually is "192.168.1.50:port"
+		// r.RemoteAddr includes the port (e.g. 192.168.1.50:54321)
+		// We strip the port to store just the IP for easier 'accept' commands
+		ip := strings.Split(r.RemoteAddr, ":")[0]
 
 		mutex.Lock()
 		PendingHosts[ip] = hostname
 		mutex.Unlock()
 
 		fmt.Printf("\n[!] New Request: Hostname [%s] at IP [%s]", hostname, ip)
-		fmt.Print("\nType 'sentinel accept <IP>' to authorize.\n> ")
+		fmt.Printf("\nType: sentinel accept %s\n> ", ip)
 	})
 
-	fmt.Printf("[*] Jumpbox Daemon started on port %s...\n", port)
+	fmt.Printf("[*] Jumpbox Daemon listening on port %s...\n", port)
 	http.ListenAndServe(":"+port, nil)
 }
 
-// SendRequest is called by the Child during installation
+// SendRequest is called by the Child (Thin Agent)
 func SendRequest(jumpboxIP string) {
 	hostname, _ := os.Hostname()
 	url := fmt.Sprintf("http://%s:9090/register?host=%s", jumpboxIP, hostname)
 	
-	fmt.Println("[*] Contacting Jumpbox...")
+	fmt.Println("[*] Requesting connection to Jumpbox...")
 	_, err := http.Post(url, "text/plain", nil)
 	if err != nil {
 		fmt.Printf("[!] Connection failed: %v\n", err)
 		return
 	}
 
-	// Start a temporary listener to receive the RSA key back from Jumpbox
+	// Temporary listener for the RSA key push
 	http.HandleFunc("/finalize", func(w http.ResponseWriter, r *http.Request) {
 		key, _ := io.ReadAll(r.Body)
 		
-		// Ensure the .ssh folder exists for the sentinelx user
+		// Create the directory for the sentinelx user
 		os.MkdirAll("/home/sentinelx/.ssh", 0700)
 		
 		err := os.WriteFile("/home/sentinelx/.ssh/authorized_keys", key, 0600)
 		if err != nil {
-			fmt.Println("[!] Failed to save key:", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		fmt.Println("[+] Key received! You are now managed by the Jumpbox.")
-		os.Exit(0) // Child setup is complete
+		fmt.Println("[+] Key received! Trust established.")
+		// We don't os.Exit(0) here if we want the daemon to keep running
+		w.WriteHeader(http.StatusOK)
 	})
 	
-	fmt.Println("[*] Waiting for Jumpbox administrator to 'accept' this host...")
+	fmt.Println("[*] Awaiting administrator approval...")
 	http.ListenAndServe(":9091", nil)
 }
 
-// AcceptHost is called by the Jumpbox admin to finalize trust and save to inventory
+// AcceptHost maps the hostname to IP and saves it to the inventory
 func AcceptHost(childIP string) {
 	mutex.Lock()
 	hostname, exists := PendingHosts[childIP]
 	mutex.Unlock()
 
 	if !exists {
-		// If exact match fails, check if we need to strip the port from the IP
-		fmt.Printf("[!] Error: No pending request found for %s\n", childIP)
+		fmt.Printf("[!] Error: No pending request found for IP: %s\n", childIP)
 		return
 	}
 
-	// 1. Read Jumpbox Public Key
+	// 1. Read Jumpbox Public Key (Generated during install)
 	pubKey, err := os.ReadFile("/etc/sentinelx/id_rsa.pub")
 	if err != nil {
-		fmt.Println("[!] Error: Jumpbox keys not found. Run 'install' first.")
+		fmt.Println("[!] Error: Public key not found at /etc/sentinelx/id_rsa.pub")
 		return
 	}
 
-	// 2. Save to hosts.yml (The Inventory)
+	// 2. SAVE TO HOSTS.YML (The core of your requested change)
 	saveToInventory(hostname, childIP)
 
-	// 3. Send the key back to the child host
+	// 3. Push key to Child
 	url := fmt.Sprintf("http://%s:9091/finalize", childIP)
-	_, err = http.Post(url, "text/plain", bytes.NewBuffer(pubKey))
-	if err != nil {
-		fmt.Printf("[!] Failed to send key to child: %v\n", err)
+	resp, err := http.Post(url, "text/plain", bytes.NewBuffer(pubKey))
+	if err != nil || resp.StatusCode != 200 {
+		fmt.Printf("[!] Failed to push key to %s\n", childIP)
 		return
 	}
 
-	fmt.Printf("[+] Success! %s (%s) added to hosts.yml and authorized.\n", hostname, childIP)
+	fmt.Printf("[+] Success! %s (%s) is now in your inventory.\n", hostname, childIP)
 }
 
-// saveToInventory appends the host to a simple YAML-style file
 func saveToInventory(name, ip string) {
+	// We use a simplified YAML format that is easy to append to
 	entry := fmt.Sprintf("- name: %s\n  ip: %s\n", name, ip)
+	
+	// Create or append to hosts.yml
 	f, err := os.OpenFile("hosts.yml", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Println("[!] Could not update hosts.yml")
+		fmt.Println("[!] Error writing to hosts.yml")
 		return
 	}
 	defer f.Close()
 	f.WriteString(entry)
+}
+
+// ListPending displays all current requests
+func ListPending() {
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(PendingHosts) == 0 {
+		fmt.Println("No pending requests.")
+		return
+	}
+	fmt.Println("Pending Host Requests:")
+	for ip, name := range PendingHosts {
+		fmt.Printf(" - %s (%s)\n", name, ip)
+	}
 }
