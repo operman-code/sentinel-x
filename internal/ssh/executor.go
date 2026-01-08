@@ -1,16 +1,20 @@
 package ssh
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
-	"gopkg.in/yaml.v3" // Make sure to run: go get gopkg.in/yaml.v3
+	"gopkg.in/yaml.v3"
 )
 
-// HostEntry defines the structure for our YAML inventory
+// --- DATA MODELS ---
+
 type HostEntry struct {
 	Name string `yaml:"name"`
 	IP   string `yaml:"ip"`
@@ -20,93 +24,118 @@ type Inventory struct {
 	Hosts []HostEntry `yaml:"hosts"`
 }
 
-// ExecuteRemote finds the target and runs the command with immediate output
+// --- KEY GENERATION ---
+
+// GenerateMasterKeys creates the RSA pair for the Jumpbox in /etc/sentinelx
+func GenerateMasterKeys() {
+	os.MkdirAll("/etc/sentinelx", 0700)
+
+	reader := rand.Reader
+	bitSize := 2048
+	key, _ := rsa.GenerateKey(reader, bitSize)
+
+	// 1. Save Private Key
+	privFile, _ := os.Create("/etc/sentinelx/id_rsa")
+	defer privFile.Close()
+	privBlock := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}
+	pem.Encode(privFile, privBlock)
+	os.Chmod("/etc/sentinelx/id_rsa", 0600)
+
+	// 2. Save Public Key
+	pub, _ := ssh.NewPublicKey(&key.PublicKey)
+	pubBytes := ssh.MarshalAuthorizedKey(pub)
+	os.WriteFile("/etc/sentinelx/id_rsa.pub", pubBytes, 0644)
+	
+	fmt.Println("[+] Master SSH Keys generated successfully.")
+}
+
+// --- REMOTE EXECUTION ---
+
+// ExecuteRemote resolves Alias -> IP and runs the command with real-time output
 func ExecuteRemote(target, command string) {
 	targetIP := target
 
-	// 1. Try to find the IP by Alias in hosts.yml
+	// 1. Resolve Alias from hosts.yml
 	inventory := loadInventory()
 	for _, host := range inventory.Hosts {
 		if host.Name == target {
 			targetIP = host.IP
-			fmt.Printf("[*] Alias matched: %s -> %s\n", target, targetIP)
+			fmt.Printf("[*] Alias Matched: %s -> %s\n", target, targetIP)
 			break
 		}
 	}
 
-	// 2. SSH Connection Setup
-	// Note: We use the sentinelx user we created during install
+	// 2. Load Private Key for Auth
+	keyBytes, err := os.ReadFile("/etc/sentinelx/id_rsa")
+	if err != nil {
+		fmt.Println("[!] Error: Private key not found. Did you run 'install'?")
+		return
+	}
+
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		fmt.Printf("[!] Error parsing private key: %v\n", err)
+		return
+	}
+
 	config := &ssh.ClientConfig{
 		User: "sentinelx",
 		Auth: []ssh.AuthMethod{
-			// This assumes your private key is at the default Jumpbox location
-			publicKeyAuth("/etc/sentinelx/id_rsa"),
+			ssh.PublicKeys(signer),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
+	// 3. Connect to Remote Child
 	client, err := ssh.Dial("tcp", targetIP+":22", config)
 	if err != nil {
-		fmt.Printf("[!] Failed to connect to %s: %v\n", targetIP, err)
+		fmt.Printf("[!] Connection failed to %s: %v\n", targetIP, err)
 		return
 	}
 	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
-		fmt.Printf("[!] Failed to create session: %v\n", err)
+		fmt.Printf("[!] Failed to create SSH session: %v\n", err)
 		return
 	}
 	defer session.Close()
 
-	// 3. THE MAGIC: Immediate redirection to your screen
+	// 4. THE MAGIC: Redirect pipes for live streaming
 	session.Stdout = os.Stdout
 	session.Stderr = os.Stderr
 	session.Stdin = os.Stdin
 
-	fmt.Printf("--- Output from %s ---\n", target)
-	err = session.Run(command)
-	if err != nil {
-		fmt.Printf("\n[!] Command failed: %v\n", err)
+	fmt.Printf("--- Sentinel-X: %s ---\n", target)
+	if err := session.Run(command); err != nil {
+		fmt.Printf("\n[!] Execution Error: %v\n", err)
 	}
 }
 
-// ListHosts reads the inventory and prints it nicely
+// --- INVENTORY HELPERS ---
+
+// ListHosts prints a clean table of managed servers
 func ListHosts() {
-	inventory := loadInventory()
-	if len(inventory.Hosts) == 0 {
-		fmt.Println("Inventory is empty. Use 'sentinel accept <IP>' to add hosts.")
+	inv := loadInventory()
+	if len(inv.Hosts) == 0 {
+		fmt.Println("No hosts in inventory.")
 		return
 	}
 
-	fmt.Println("Managed Sentinel-X Hosts:")
-	fmt.Printf("%-20s %-15s\n", "HOSTNAME", "IP ADDRESS")
+	fmt.Printf("%-20s %-15s\n", "ALIAS/NAME", "IP ADDRESS")
 	fmt.Println(strings.Repeat("-", 35))
-	for _, h := range inventory.Hosts {
+	for _, h := range inv.Hosts {
 		fmt.Printf("%-20s %-15s\n", h.Name, h.IP)
 	}
 }
 
-// loadInventory helper to parse hosts.yml
+// loadInventory reads and parses the hosts.yml file
 func loadInventory() Inventory {
 	var inv Inventory
-	yamlFile, err := ioutil.ReadFile("hosts.yml")
+	data, err := os.ReadFile("hosts.yml")
 	if err != nil {
-		return inv // Return empty if file doesn't exist
+		return inv // Return empty if file missing
 	}
-	yaml.Unmarshal(yamlFile, &inv)
+	yaml.Unmarshal(data, &inv)
 	return inv
-}
-
-// publicKeyAuth helper for SSH authentication
-func publicKeyAuth(keyPath string) ssh.AuthMethod {
-	key, err := ioutil.ReadFile(keyPath)
-	if err != nil {
-		return nil
-	}
-	signer, err := ssh.ParsePrivateKey(key)
-	if err != nil {
-		return nil
-	}
-	return ssh.PublicKeys(signer)
 }
