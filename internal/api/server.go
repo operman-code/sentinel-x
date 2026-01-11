@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"gopkg.in/yaml.v3"
 )
@@ -26,7 +27,6 @@ type Inventory struct {
 
 // StartRegistrationServer runs on the Jumpbox
 func StartRegistrationServer(port string) {
-	// NEW: Wipe pending requests on startup to clear any past "dead" sessions
 	fmt.Println("[*] System Start: Cleaning up old pending requests...")
 	writeData(PendingPath, Inventory{Hosts: []HostEntry{}})
 	
@@ -61,7 +61,6 @@ func AcceptHost(childIP string) {
 	var newPending []HostEntry
 	found := false
 
-	// Find the host in pending list
 	for _, h := range pending.Hosts {
 		if h.IP == childIP {
 			targetEntry = h
@@ -76,7 +75,6 @@ func AcceptHost(childIP string) {
 		return
 	}
 
-	// 1. Alias Selection
 	fmt.Printf("[?] Enter custom alias for %s (Default: %s): ", childIP, targetEntry.Name)
 	var alias string
 	fmt.Scanln(&alias)
@@ -84,14 +82,12 @@ func AcceptHost(childIP string) {
 		alias = targetEntry.Name
 	}
 
-	// 2. Load Public Key from the vault
 	pubKey, err := os.ReadFile("/etc/sentinelx/id_rsa.pub")
 	if err != nil {
 		fmt.Println("[!] Critical Error: Public key not found at /etc/sentinelx/id_rsa.pub")
 		return
 	}
 
-	// 3. Push Key to Child (The Handshake)
 	url := fmt.Sprintf("http://%s:9091/finalize", childIP)
 	resp, err := http.Post(url, "text/plain", bytes.NewBuffer(pubKey))
 	if err != nil || resp.StatusCode != 200 {
@@ -99,10 +95,9 @@ func AcceptHost(childIP string) {
 		return
 	}
 
-	// 4. Update Inventory and Clear Pending
 	inventory.Hosts = append(inventory.Hosts, HostEntry{Name: alias, IP: childIP})
-	writeData(InventoryPath, inventory) 
-	writeData(PendingPath, Inventory{Hosts: newPending}) 
+	writeData(InventoryPath, inventory)
+	writeData(PendingPath, Inventory{Hosts: newPending})
 
 	fmt.Printf("[+] Success! %s (%s) is now in the active inventory.\n", alias, childIP)
 }
@@ -131,9 +126,11 @@ func loadFile(path string) Inventory {
 
 func writeData(path string, inv Inventory) {
 	data, _ := yaml.Marshal(inv)
-	// Ensure the directory exists before writing
 	os.MkdirAll("/etc/sentinelx", 0755)
-	os.WriteFile(path, data, 0644)
+	err := os.WriteFile(path, data, 0644)
+	if err != nil {
+		fmt.Printf("[!] PERMISSION ERROR: Could not write to %s. Did you use sudo?\n", path)
+	}
 }
 
 // SendRequest runs on the Child Node
@@ -153,11 +150,26 @@ func SendRequest(jumpboxIP string) {
 
 	mux.HandleFunc("/finalize", func(w http.ResponseWriter, r *http.Request) {
 		key, _ := io.ReadAll(r.Body)
+		
+		// 1. Setup SSH Key
 		os.MkdirAll("/home/sentinelx/.ssh", 0700)
 		os.WriteFile("/home/sentinelx/.ssh/authorized_keys", key, 0600)
-		fmt.Println("\n[+] Success! Master key received. Management active.")
+		exec.Command("chown", "-R", "sentinelx:sentinelx", "/home/sentinelx/.ssh").Run()
+
+		// 2. Setup Passwordless Sudo in a dedicated file
+		sudoRule := "sentinelx ALL=(ALL) NOPASSWD:ALL\n"
+		sudoPath := "/etc/sudoers.d/sentinelx"
+		
+		err := os.WriteFile(sudoPath, []byte(sudoRule), 0440)
+		if err != nil {
+			// Fallback: try using sudo echo if the binary is running as ec2-user/ubuntu
+			cmd := fmt.Sprintf("echo '%s' | sudo tee %s && sudo chmod 0440 %s", sudoRule, sudoPath, sudoPath)
+			exec.Command("bash", "-c", cmd).Run()
+		}
+
+		fmt.Println("\n[+] Success! Master key received and sudo permissions granted.")
 		w.WriteHeader(http.StatusOK)
-		go func() { server.Close() }() 
+		go func() { server.Close() }()
 	})
 	
 	fmt.Println("[*] Awaiting administrator approval on Jumpbox...")
