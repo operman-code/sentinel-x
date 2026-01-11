@@ -25,6 +25,10 @@ type Inventory struct {
 }
 
 func StartRegistrationServer(port string) {
+	// NEW: Wipe pending requests on startup to clear "dead" sessions
+    fmt.Println("[*] Cleaning up old pending requests...")
+    writeData(PendingPath, Inventory{Hosts: []HostEntry{}})
+	
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		hostname := r.URL.Query().Get("host")
 		ip := strings.Split(r.RemoteAddr, ":")[0]
@@ -49,14 +53,18 @@ func savePending(name, ip string) {
 }
 
 func AcceptHost(childIP string) {
+	// 1. Load both files using ABSOLUTE paths
 	pending := loadFile(PendingPath)
-	var autoHostname string
+	inventory := loadFile(InventoryPath)
+	
+	var targetEntry HostEntry
 	var newPending []HostEntry
 	found := false
 
+	// 2. Extract the target and filter the rest
 	for _, h := range pending.Hosts {
 		if h.IP == childIP {
-			autoHostname = h.Name
+			targetEntry = h
 			found = true
 		} else {
 			newPending = append(newPending, h)
@@ -64,38 +72,33 @@ func AcceptHost(childIP string) {
 	}
 
 	if !found {
-		fmt.Printf("[!] Error: No pending request found for IP: %s\n", childIP)
+		fmt.Printf("[!] Error: IP %s not found in pending requests.\n", childIP)
 		return
 	}
 
-	// --- ALIAS SETUP ---
-	fmt.Printf("[?] Enter a custom alias for this host (Default: %s): ", autoHostname)
+	// 3. Ask for Alias
+	fmt.Printf("[?] Enter custom alias for %s (Default: %s): ", childIP, targetEntry.Name)
 	var alias string
 	fmt.Scanln(&alias)
 	if alias == "" {
-		alias = autoHostname
+		alias = targetEntry.Name
 	}
 
-	pubKey, err := os.ReadFile("/etc/sentinelx/id_rsa.pub")
-	if err != nil {
-		fmt.Println("[!] Error: Public key not found at /etc/sentinelx/id_rsa.pub")
+	// 4. Perform Handshake (Push RSA Key)
+	if err := pushPublicKey(childIP); err != nil {
+		fmt.Printf("[!] Handshake failed: %v\n", err)
 		return
 	}
 
-	url := fmt.Sprintf("http://%s:9091/finalize", childIP)
-	resp, err := http.Post(url, "text/plain", bytes.NewBuffer(pubKey))
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Printf("[!] Failed to push key to %s. Handshake failed.\n", childIP)
-		return
-	}
-
-	finalInv := loadFile(InventoryPath)
-	finalInv.Hosts = append(finalInv.Hosts, HostEntry{Name: alias, IP: childIP})
+	// 5. SUCCESS: Update the files
+	inventory.Hosts = append(inventory.Hosts, HostEntry{Name: alias, IP: childIP})
 	
-	writeData(InventoryPath, finalInv)
-	writeData(PendingPath, Inventory{Hosts: newPending})
+	// Save Inventory (adds the new host)
+	writeData(InventoryPath, inventory) 
+	// Save Pending (removes the host we just accepted)
+	writeData(PendingPath, Inventory{Hosts: newPending}) 
 
-	fmt.Printf("[+] Success! Host '%s' (%s) is ready for commands.\n", alias, childIP)
+	fmt.Printf("[+] Success! %s moved to inventory and removed from pending.\n", alias)
 }
 
 func ListPending() {
